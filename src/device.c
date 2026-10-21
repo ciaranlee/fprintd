@@ -59,6 +59,8 @@ static gboolean delete_enrolled_fingers (FprintDevice *rdev,
                                          FpFinger      finger,
                                          GError      **error);
 
+static void close_unclaimed_device (FprintDevice *rdev);
+
 static GQuark quark_auth_user = 0;
 
 typedef enum {
@@ -119,6 +121,10 @@ typedef struct
   FprintDeviceAction     current_action;
   GCancellable          *current_cancellable;
   GDBusMethodInvocation *current_cancel_invocation;
+
+  /* Set from the suspend request until resume; libfprint refuses to
+   * close the device in between. */
+  gboolean suspended;
 } FprintDevicePrivate;
 
 G_DEFINE_TYPE_WITH_CODE (FprintDevice, fprint_device,
@@ -462,6 +468,21 @@ _fprint_device_get_id (FprintDevice *rdev)
   return priv->id;
 }
 
+/* libfprint refuses to close a suspended device. Returns TRUE if that is
+ * why closing failed, the device is then closed on resume. */
+static gboolean
+close_deferred_by_suspend (FprintDevice *rdev, GError *error)
+{
+  FprintDevicePrivate *priv = fprint_device_get_instance_private (rdev);
+
+  if (!priv->suspended ||
+      !g_error_matches (error, FP_DEVICE_ERROR, FP_DEVICE_ERROR_BUSY))
+    return FALSE;
+
+  g_debug ("Device %d is suspended, it will be closed on resume", priv->id);
+  return TRUE;
+}
+
 static void
 suspend_cb (GObject      *source_obj,
             GAsyncResult *res,
@@ -483,9 +504,22 @@ resume_cb (GObject      *source_obj,
            gpointer      user_data)
 {
   g_autoptr(GTask) task = user_data;
+  FprintDevice *rdev = g_task_get_source_object (task);
+  FprintDevicePrivate *priv = fprint_device_get_instance_private (rdev);
+
+  g_autoptr(SessionData) session = NULL;
   GError *error = NULL;
 
   fp_device_resume_finish (FP_DEVICE (source_obj), res, &error);
+  priv->suspended = FALSE;
+
+  /* Close the device if it was released while suspended. */
+  session = session_data_get (priv);
+  if (!session &&
+      priv->current_action == ACTION_NONE &&
+      fp_device_is_open (priv->dev))
+    close_unclaimed_device (rdev);
+
   if (error)
     g_task_return_error (task, error);
   else
@@ -502,6 +536,7 @@ fprint_device_suspend (FprintDevice       *rdev,
 
   /* Just forward to libfprint. */
 
+  priv->suspended = TRUE;
   task = g_task_new (rdev, NULL, callback, user_data);
   fp_device_suspend (priv->dev, NULL, suspend_cb, task);
 }
@@ -978,7 +1013,8 @@ _fprint_device_client_vanished (GDBusConnection *connection,
       g_clear_pointer (&session, session_data_unref);
       session = session_data_get (priv);
       if (session && !fp_device_close_sync (priv->dev, NULL, &error))
-        g_critical ("Error closing device after disconnect: %s", error->message);
+        if (!close_deferred_by_suspend (rdev, error))
+          g_critical ("Error closing device after disconnect: %s", error->message);
 
       session_data_set_new (priv, NULL, NULL);
     }
@@ -1105,10 +1141,91 @@ fprint_device_claim (FprintDBusDevice      *dbus_dev,
 
   g_debug ("user '%s' claiming the device: %d", session->username, priv->id);
 
+  /* The device may still be open from a release that happened while it
+   * was suspended. Close it first, the open is started once that is done. */
+  if (priv->current_action == ACTION_CLOSE)
+    /* This can only be the close started by close_unclaimed_device(): a
+     * normal Release keeps its session until dev_close_cb() runs, and
+     * _fprint_device_check_claimed() rejects a Claim while a session
+     * exists. */
+    return TRUE;
+
+  if (priv->current_action == ACTION_NONE && fp_device_is_open (priv->dev))
+    {
+      close_unclaimed_device (rdev);
+      return TRUE;
+    }
+
   priv->current_action = ACTION_OPEN;
   fp_device_open (priv->dev, NULL, (GAsyncReadyCallback) dev_open_cb, rdev);
 
   return TRUE;
+}
+
+static void
+dev_close_unclaimed_cb (FpDevice *dev, GAsyncResult *res, void *user_data)
+{
+  g_autoptr(GError) error = NULL;
+  g_autoptr(FprintDevice) rdev = user_data;
+  FprintDevicePrivate *priv = fprint_device_get_instance_private (rdev);
+
+  g_autoptr(SessionData) session = NULL;
+
+  priv->current_action = ACTION_NONE;
+  session = session_data_get (priv);
+
+  if (!fp_device_close_finish (dev, res, &error))
+    {
+      if (close_deferred_by_suspend (rdev, error))
+        {
+          /* A claim arrived while suspended, the device is closed on resume */
+          if (session && session->invocation)
+            {
+              g_autoptr(GDBusMethodInvocation) invocation = NULL;
+
+              invocation = g_steal_pointer (&session->invocation);
+              g_dbus_method_invocation_return_error_literal (invocation,
+                                                             FPRINT_ERROR,
+                                                             FPRINT_ERROR_INTERNAL,
+                                                             "Device is suspended, cannot claim it yet");
+              session_data_set_new (priv, NULL, NULL);
+            }
+          return;
+        }
+
+      g_warning ("Failed to close unclaimed device %d: %s", priv->id, error->message);
+    }
+  else
+    {
+      g_debug ("closed unclaimed device %d", priv->id);
+    }
+
+  /* Start the open of a claim that arrived while closing. */
+  if (session && session->invocation)
+    {
+      priv->current_action = ACTION_OPEN;
+      fp_device_open (priv->dev, NULL, (GAsyncReadyCallback) dev_open_cb, rdev);
+    }
+}
+
+/* libfprint refuses to close a suspended device (FP_DEVICE_ERROR_BUSY), so
+ * a release during suspend leaves the device open without a session, and
+ * any later open fails with FP_DEVICE_ERROR_ALREADY_OPEN. Close it here,
+ * on resume or before the next claim.
+ * A session may exist when this runs: it then represents a pending Claim,
+ * as fprint_device_claim() deliberately creates the session before starting
+ * this close, and the open is started from dev_close_unclaimed_cb(). */
+static void
+close_unclaimed_device (FprintDevice *rdev)
+{
+  FprintDevicePrivate *priv = fprint_device_get_instance_private (rdev);
+
+  g_debug ("closing device %d that was left open", priv->id);
+
+  /* Keep rdev alive while closing: readers often re-enumerate after resume. */
+  priv->current_action = ACTION_CLOSE;
+  fp_device_close (priv->dev, NULL, (GAsyncReadyCallback) dev_close_unclaimed_cb,
+                   g_object_ref (rdev));
 }
 
 static void
@@ -1130,6 +1247,14 @@ dev_close_cb (FpDevice *dev, GAsyncResult *res, void *user_data)
   if (!fp_device_close_finish (dev, res, &error))
     {
       g_autoptr(GError) dbus_error = NULL;
+
+      if (close_deferred_by_suspend (rdev, error))
+        {
+          /* The device is closed on resume, see close_unclaimed_device() */
+          fprint_dbus_device_complete_release (FPRINT_DBUS_DEVICE (rdev),
+                                               invocation);
+          return;
+        }
 
       dbus_error = g_error_new (FPRINT_ERROR,
                                 FPRINT_ERROR_INTERNAL,
