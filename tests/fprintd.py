@@ -1762,10 +1762,169 @@ class FPrintdVirtualDeviceTest(FPrintdVirtualDeviceBaseTest):
 
         self.device.Release()
 
+    def _suspend_during_verify(self, device=None):
+        if device is None:
+            device = self.device
+
+        # Get a running task, so that libfprint cancels it on suspend
+        device.VerifyStart('(s)', 'right-thumb')
+
+        self.logind_obj.EmitSignal("", "PrepareForSleep", "b", [True])
+
+        self.daemon_log.check_line('Preparing devices for sleep', timeout=1)
+        self.wait_for_result(expected='verify-unknown-error')
+        self.assertTrue(self._verify_stopped)
+        self.wait_released_delay_inhibitor(timeout=1)
+
+    def _resume_and_wait(self):
+        self.logind_obj.EmitSignal("", "PrepareForSleep", "b", [False])
+
+        self.daemon_log.check_line('Preparing devices for resume', timeout=1)
+        # libfprint refused to close the device while suspended, so fprintd
+        # must close it once resumed. Note that the "Got delay inhibitor"
+        # line may be printed before or after this one.
+        self.daemon_log.check_line('closed unclaimed device', timeout=1)
+
+    def _assert_device_usable(self):
+        self.device.Claim('(s)', 'testuser')
+        self.verify_start('right-thumb')
+        self.send_image('whorl')
+        self.assertVerifyMatch(selected_finger='right-thumb')
+        self.device.VerifyStop()
+        self.device.Release()
+
+    def test_suspend_release_while_suspended(self):
+        self.device.Claim('(s)', 'testuser')
+        self.enroll_image('whorl', finger='right-thumb')
+
+        self._suspend_during_verify()
+
+        self.device.VerifyStop()
+        # libfprint refuses to close a suspended device, but the client
+        # must still be able to release it.
+        self.device.Release()
+        self.daemon_log.check_line('is suspended, it will be closed on resume',
+            timeout=1)
+
+        self._resume_and_wait()
+        self._assert_device_usable()
+
+    def test_suspend_disconnect_while_suspended(self):
+        self.device.Claim('(s)', 'testuser')
+        self.enroll_image('whorl', finger='right-thumb')
+        self.device.Release()
+
+        bus, dev = self.get_secondary_bus_and_device(claim='testuser')
+        bus_name = bus.get_unique_name()
+
+        self._suspend_during_verify(device=dev)
+
+        name_vanished = False
+        def name_owner_changed_cb(*args):
+            nonlocal name_vanished
+            name_vanished = True
+
+        sub_id = self.dbus.signal_subscribe('org.freedesktop.DBus',
+            'org.freedesktop.DBus', 'NameOwnerChanged', '/org/freedesktop/DBus',
+            bus_name, Gio.DBusSignalFlags.NONE, name_owner_changed_cb)
+        self.addCleanup(self.dbus.signal_unsubscribe, sub_id)
+
+        # Disconnect without stopping the verification or releasing
+        bus.close_sync()
+
+        while not name_vanished:
+            ctx.iteration(True)
+
+        # The daemon processes the vanished client before the resume signal
+        self.daemon_log.check_line('is suspended, it will be closed on resume',
+            timeout=1)
+        self._resume_and_wait()
+        self._assert_device_usable()
+
+    def test_suspend_release_while_suspended_claim_on_resume(self):
+        self.device.Claim('(s)', 'testuser')
+        self.enroll_image('whorl', finger='right-thumb')
+
+        self._suspend_during_verify()
+
+        self.device.VerifyStop()
+        self.device.Release()
+
+        # Claim right away, without waiting for the device to be closed
+        self.logind_obj.EmitSignal("", "PrepareForSleep", "b", [False])
+        self.device.Claim('(s)', 'testuser')
+
+        self.daemon_log.check_line('Preparing devices for resume', timeout=1)
+        self.wait_got_delay_inhibitor(timeout=1)
+
+        self.verify_start('right-thumb')
+        self.send_image('whorl')
+        self.assertVerifyMatch(selected_finger='right-thumb')
+        self.device.VerifyStop()
+        self.device.Release()
+
+    def test_suspend_claim_while_suspended(self):
+        self.device.Claim('(s)', 'testuser')
+        self.enroll_image('whorl', finger='right-thumb')
+
+        self._suspend_during_verify()
+
+        self.device.VerifyStop()
+        self.device.Release()
+        self.daemon_log.check_line('is suspended, it will be closed on resume',
+            timeout=1)
+
+        # The device is still open and cannot be closed until resume
+        with self.assertFprintError('Internal') as cm:
+            self.device.Claim('(s)', 'testuser')
+        self.assertIn('Device is suspended, cannot claim it yet',
+            str(cm.exception))
+        self.daemon_log.check_line('is suspended, it will be closed on resume',
+            timeout=1)
+
+        self._resume_and_wait()
+        self._assert_device_usable()
+
 
 class FPrintdVirtualDeviceStorageTest(FPrintdVirtualStorageDeviceBaseTest,
                                       FPrintdVirtualDeviceTest):
     # Repeat the tests for the Virtual storage device
+
+    def test_suspend_claim_during_close_on_resume(self):
+        self.device.Claim('(s)', 'testuser')
+        self.enroll_image('whorl', finger='right-thumb')
+
+        self._suspend_during_verify()
+
+        self.device.VerifyStop()
+        self.device.Release()
+        self.daemon_log.check_line('is suspended, it will be closed on resume',
+            timeout=1)
+
+        # Delay the next close, i.e. the one started on resume
+        sleep_ms = get_timeout('device_sleep') * 5
+        self.send_sleep(sleep_ms)
+
+        self.logind_obj.EmitSignal("", "PrepareForSleep", "b", [False])
+        self.daemon_log.check_line('closing device 0 that was left open',
+            timeout=1)
+        self.daemon_log.check_line('Sleeping {}ms'.format(sleep_ms), timeout=1)
+
+        # Claim while that close is still in flight
+        self.call_device_method_async('Claim', '(s)', ['testuser'])
+        self.wait_for_result(max_wait=sleep_ms / 2)
+        self.assertFalse(self.get_all_async_replies())
+
+        self.daemon_log.check_line('closed unclaimed device',
+            timeout=get_timeout())
+        self.wait_for_device_reply(method='Claim')
+
+        self.verify_start('right-thumb')
+        self.send_image('whorl')
+        self.assertVerifyMatch(selected_finger='right-thumb')
+        self.device.VerifyStop()
+        self.device.Release()
+
     def test_claim_error(self):
         self.device.Claim('(s)', self.get_current_user())
         self.addCleanup(self.try_release)
